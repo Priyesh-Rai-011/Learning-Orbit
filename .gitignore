@@ -1,0 +1,16 @@
+# Ignore Maven build output
+**/target/
+*.class
+
+# Ignore IDE specific files
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# Ignore OS files
+Thumbs.db
+.DS_Store
+
+# Ignore Docker temp files (optional but good)
+.docker/
