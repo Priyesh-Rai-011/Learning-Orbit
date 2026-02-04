@@ -8,6 +8,14 @@ services:
       - "8001:8001"
     volumes:
       - redis-data:/data
+    networks:
+      - learning-network
     restart: unless-stopped
+
+
 volumes:
   redis-data:
+
+networks:
+  learning-network:
+    external: true
