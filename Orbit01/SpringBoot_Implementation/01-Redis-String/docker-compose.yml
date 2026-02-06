@@ -7,6 +7,9 @@ services:
       - "8080:8080"
     volumes:
       - .:/app  # Syncs your Windows code folder with the container
+    working_dir: /app
+    command: mvn spring-boot:run
+    
     networks:
       - learning-network
     environment:
