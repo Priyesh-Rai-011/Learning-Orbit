@@ -1,0 +1,21 @@
+# version: '3.8'
+services:
+  java-dev:
+    build: .
+    container_name: java-02-lists
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app  # Syncs your Windows code folder with the container
+    working_dir: /app
+    command: mvn spring-boot:run
+    
+    networks:
+      - learning-network
+    environment:
+      - SPRING_DATA_REDIS_HOST=redis-stack
+      - SPRING_DATA_REDIS_PORT=6379
+
+networks:
+  learning-network:
+    external: true

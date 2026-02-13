@@ -42,6 +42,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+// import javax.tools.StandardLocation;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -368,7 +370,8 @@ public class StringPracticeController {
         Map<String, Object> response = new LinkedHashMap<>();
 
         Long count = redisTemplate.execute((RedisCallback<Long>) connection ->
-                connection.bitCount(key.getBytes(StandardCharsets.UTF_8))
+                // connection.bitCount(key.getBytes(StandardCharsets.UTF_8))
+                connection.stringCommands().bitCount(key.getBytes(StandardCharsets.UTF_8))
         );
 
         response.put("status", "success");

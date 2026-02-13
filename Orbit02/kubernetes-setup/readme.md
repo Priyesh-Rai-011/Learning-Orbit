@@ -147,7 +147,7 @@ or via AWS SSM Session Manager (better than bastion)
 
 So bastion is not mandatory.
 
-10) Clean Final Architecture Summary
+## 10) Clean Final Architecture Summary
 VPC
 
 Contains:
