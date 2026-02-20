@@ -1,0 +1,327 @@
+​name: verbal-desktop-app-pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"  # Production: trigger on version tags
+      - "desk-prod-v*.*.*"  # Production: trigger on desktop production version tags
+    branches:
+      - 'release/**'  # Staging: trigger on release branches
+      - develop  # Development: trigger on develop branch
+    paths:
+      - 'front/**'
+      - '.github/workflows/verbal-desktop-app-pipeline.yaml'
+
+env:
+  TARGET_BUCKET_NAME: verbal-desktop-app-artifacts
+  ZONE: us-west-2
+
+jobs:
+  setup:
+    name: Determine Environment Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      gke_cluster_name: ${{ steps.set-env.outputs.gke_cluster_name }}
+      namespace: ${{ steps.set-env.outputs.namespace }}
+      gcp_project_id: ${{ steps.set-env.outputs.gcp_project_id }}
+      service_account_secret: ${{ steps.set-env.outputs.service_account_secret }}
+    steps:
+      - name: Determine environment from trigger
+        id: set-env
+        run: |
+          # Check if triggered by a tag (production)
+          if [[ "${{ github.ref }}" == refs/tags/v*.*.* ]] || [[ "${{ github.ref }}" == refs/tags/desk-prod-v*.*.* ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "gke_cluster_name=duploinfra-prod01" >> $GITHUB_OUTPUT
+            echo "namespace=duploservices-app" >> $GITHUB_OUTPUT
+            echo "gcp_project_id=duplo-prod-439614" >> $GITHUB_OUTPUT
+            echo "service_account_secret=GCP_PROD_SERVICE_ACCOUNT_KEY_BASE64" >> $GITHUB_OUTPUT
+          # Check if triggered by release/** branch (staging)
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "gke_cluster_name=duploinfra-nonprod01" >> $GITHUB_OUTPUT
+            echo "namespace=duploservices-staging" >> $GITHUB_OUTPUT
+            echo "gcp_project_id=duplo-non-prod-434116" >> $GITHUB_OUTPUT
+            echo "service_account_secret=GCP_SERVICE_ACCOUNT_KEY_BASE64" >> $GITHUB_OUTPUT
+          # Check if triggered by develop branch (development)
+          elif [[ "${{ github.ref }}" == refs/heads/develop ]]; then
+            echo "environment=development" >> $GITHUB_OUTPUT
+            echo "gke_cluster_name=duploinfra-nonprod01" >> $GITHUB_OUTPUT
+            echo "namespace=duploservices-dev01" >> $GITHUB_OUTPUT
+            echo "gcp_project_id=duplo-non-prod-434116" >> $GITHUB_OUTPUT
+            echo "service_account_secret=GCP_SERVICE_ACCOUNT_KEY_BASE64" >> $GITHUB_OUTPUT
+          else
+            echo "Unknown trigger: ${{ github.ref }}"
+            exit 1
+          fi
+
+  build-windows:
+    name: Build Windows Application
+    runs-on: windows-latest
+    needs: setup
+    defaults:
+      run:
+        working-directory: front
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Extract version and product name from package.json
+      - name: Get version and product name from package.json
+        id: package-version
+        shell: bash
+        run: |
+          VERSION=$(jq -r '.version' package.json)
+          PRODUCT_NAME=$(jq -r '.build.productName' package.json)
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Error: Failed to extract version from package.json"
+            exit 1
+          fi
+
+          if [ -z "$PRODUCT_NAME" ] || [ "$PRODUCT_NAME" = "null" ]; then
+            echo "Error: Failed to extract build.productName from package.json"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "PRODUCT_NAME=$PRODUCT_NAME" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+          echo "Extracted product name: $PRODUCT_NAME"
+
+      # Get short commit SHA
+      - name: Get short commit SHA
+        id: commit-sha
+        shell: bash
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "Short commit SHA: $SHORT_SHA"
+
+      # Set up Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '24'
+          cache: 'yarn'
+          cache-dependency-path: front/yarn.lock
+
+      # Set up Google Cloud for environment config
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ needs.setup.outputs.gcp_project_id }}
+          service_account_key: '${{ secrets[needs.setup.outputs.service_account_secret] }}'
+          export_default_credentials: true
+
+      - name: Install Google Cloud SDK plugins
+        shell: bash
+        run: |
+          set -e
+          gcloud components update
+          gcloud components install gke-gcloud-auth-plugin kubectl
+
+      - name: Authenticate to GKE
+        shell: bash
+        run: |
+          set -e
+          echo "${{ secrets[needs.setup.outputs.service_account_secret] }}" | base64 --decode > $HOME/gcp-key.json
+          gcloud auth activate-service-account --key-file=$HOME/gcp-key.json
+          export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+          gcloud container clusters get-credentials ${{ needs.setup.outputs.gke_cluster_name }} \
+            --zone ${{ env.ZONE }} \
+            --project ${{ needs.setup.outputs.gcp_project_id }}
+
+      - name: Load environment variables from K8S
+        shell: bash
+        run: |
+          set -e
+          kubectl get secret front-common -n ${{ needs.setup.outputs.namespace }} -o json | jq '.data | map_values(@base64d)' | sed 's/: /=/' | tail -n +2 | sed '$d' | sed 's/^/export /' | sed 's/" / /' | sed 's/",/"/' > tmp.env
+
+      - name: Install Python for native modules
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -e
+          python --version
+          pip install --break-system-packages setuptools
+
+      - name: Install dependencies
+        shell: bash
+        run: yarn install --immutable
+
+      # No need to update version - we'll use the version from package.json
+
+      - name: Build Electron app for Windows
+        shell: bash
+        run: |
+          set -e
+          source tmp.env
+          yarn run electron:build:win
+        env:
+          ELECTRON: true
+          VITE_APP_ENV: ${{ needs.setup.outputs.environment }}
+          VITE_COMMIT_ID: ${{ steps.commit-sha.outputs.SHORT_SHA }}
+
+      - name: List build artifacts
+        shell: bash
+        run: |
+          echo "Build artifacts created:"
+          ls -lah dist/
+
+      # Note: Output artifact names are hardcoded to "Verbal-*" (not using PRODUCT_NAME) to maintain
+      # backwards-compatible download URLs. Changing these would break existing download links.
+      - name: Rename artifacts with version and environment
+        id: rename-artifacts
+        shell: bash
+        run: |
+          VERSION="${{ steps.package-version.outputs.VERSION }}"
+          PRODUCT_NAME="${{ steps.package-version.outputs.PRODUCT_NAME }}"
+          ENV="${{ needs.setup.outputs.environment }}"
+          PORTABLE_EXISTS=false
+          INSTALLER_EXISTS=false
+
+          echo "Looking for build artifacts..."
+          echo "Product name: $PRODUCT_NAME"
+          ls -lah dist/
+
+          # Rename portable EXE file (e.g., "Verbal AI App 0.2.32.exe" -> "Verbal-0.2.32-development.exe")
+          PORTABLE_FILE="dist/${PRODUCT_NAME} ${VERSION}.exe"
+          if [ -f "$PORTABLE_FILE" ]; then
+            NEW_PORTABLE_NAME="Verbal-${VERSION}-${ENV}.exe"
+            mv "$PORTABLE_FILE" "dist/$NEW_PORTABLE_NAME"
+            echo "Renamed portable EXE to: $NEW_PORTABLE_NAME"
+            PORTABLE_EXISTS=true
+            echo "PORTABLE_EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Portable EXE not found at: $PORTABLE_FILE"
+            echo "PORTABLE_EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Rename installer EXE file (e.g., "Verbal AI App Setup 0.2.32.exe" -> "Verbal-Setup-0.2.32-development.exe")
+          INSTALLER_FILE="dist/${PRODUCT_NAME} Setup ${VERSION}.exe"
+          if [ -f "$INSTALLER_FILE" ]; then
+            NEW_INSTALLER_NAME="Verbal-Setup-${VERSION}-${ENV}.exe"
+            mv "$INSTALLER_FILE" "dist/$NEW_INSTALLER_NAME"
+            echo "Renamed installer EXE to: $NEW_INSTALLER_NAME"
+            INSTALLER_EXISTS=true
+            echo "INSTALLER_EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Installer EXE not found at: $INSTALLER_FILE"
+            echo "INSTALLER_EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Final artifacts:"
+          ls -lah dist/
+
+          # Fail if no artifacts were found
+          if [ "$PORTABLE_EXISTS" = false ] && [ "$INSTALLER_EXISTS" = false ]; then
+            echo "Error: No Windows artifacts found (neither portable nor installer EXE)"
+            exit 1
+          fi
+
+      - name: Sign Windows portable executable with SSL.com CodeSigner
+        if: steps.rename-artifacts.outputs.PORTABLE_EXISTS == 'true'
+        uses: sslcom/esigner-codesign@develop
+        with:
+          command: sign
+          username: ${{ secrets.SSL_COM_USERNAME }}
+          password: ${{ secrets.SSL_COM_PASSWORD }}
+          credential_id: ${{ secrets.SSL_COM_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.SSL_COM_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/front/dist/Verbal-${{ steps.package-version.outputs.VERSION }}-${{ needs.setup.outputs.environment }}.exe
+          malware_block: false
+          override: true
+
+      - name: Sign Windows installer executable with SSL.com CodeSigner
+        if: steps.rename-artifacts.outputs.INSTALLER_EXISTS == 'true'
+        uses: sslcom/esigner-codesign@develop
+        with:
+          command: sign
+          username: ${{ secrets.SSL_COM_USERNAME }}
+          password: ${{ secrets.SSL_COM_PASSWORD }}
+          credential_id: ${{ secrets.SSL_COM_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.SSL_COM_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/front/dist/Verbal-Setup-${{ steps.package-version.outputs.VERSION }}-${{ needs.setup.outputs.environment }}.exe
+          malware_block: false
+          override: true
+
+      - name: Upload to S3
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ steps.package-version.outputs.VERSION }}"
+          ENV="${{ needs.setup.outputs.environment }}"
+          PLATFORM="windows"
+          BUCKET_NAME="${{ env.TARGET_BUCKET_NAME }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          BUILD_DATE=$(date +%Y-%m-%d)
+
+          S3_PATH="gs://${BUCKET_NAME}/builds/${PLATFORM}/${VERSION}/${BUILD_DATE}/${SHORT_SHA}/${ENV}/"
+          LATEST_PATH="gs://${BUCKET_NAME}/builds/${PLATFORM}/latest/${ENV}/"
+
+          # Upload portable EXE
+          if [ -f "dist/Verbal-${VERSION}-${ENV}.exe" ]; then
+            gsutil cp "dist/Verbal-${VERSION}-${ENV}.exe" "${S3_PATH}Verbal.exe"
+            echo "Uploaded portable EXE to: ${S3_PATH}Verbal.exe"
+
+            # Upload to latest path
+            gsutil cp "dist/Verbal-${VERSION}-${ENV}.exe" "${LATEST_PATH}Verbal.exe"
+            echo "Uploaded latest portable EXE to: ${LATEST_PATH}Verbal.exe"
+          fi
+
+          # Upload installer EXE
+          if [ -f "dist/Verbal-Setup-${VERSION}-${ENV}.exe" ]; then
+            gsutil cp "dist/Verbal-Setup-${VERSION}-${ENV}.exe" "${S3_PATH}Verbal-Setup.exe"
+            echo "Uploaded installer EXE to: ${S3_PATH}Verbal-Setup.exe"
+
+            # Upload to latest path
+            gsutil cp "dist/Verbal-Setup-${VERSION}-${ENV}.exe" "${LATEST_PATH}Verbal-Setup.exe"
+            echo "Uploaded latest installer EXE to: ${LATEST_PATH}Verbal-Setup.exe"
+          fi
+
+      - name: Generate and upload latest-win manifest
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ steps.package-version.outputs.VERSION }}"
+          ENV="${{ needs.setup.outputs.environment }}"
+          BUCKET_NAME="${{ env.TARGET_BUCKET_NAME }}"
+          RELEASE_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BUILD_DATE=$(date +%Y-%m-%d)
+          COMMIT_SHA="${{ github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          EXE_FILE="dist/Verbal-${VERSION}-${ENV}.exe"
+
+          if [ -f "$EXE_FILE" ]; then
+            # Calculate SHA256 (using sha256sum on Windows Git Bash)
+            SHA256=$(sha256sum "$EXE_FILE" | awk '{print $1}')
+
+            # Get file size in bytes (GNU stat syntax for Git Bash on Windows)
+            SIZE=$(stat --printf=%s "$EXE_FILE")
+
+            # Path to actual versioned artifact (includes commit ID)
+            ARTIFACT_PATH="builds/windows/${VERSION}/${BUILD_DATE}/${SHORT_SHA}/${ENV}/Verbal.exe"
+
+            # Generate JSON manifest
+            printf '{\n  "version": "%s",\n  "releaseDate": "%s",\n  "path": "%s",\n  "sha256": "%s",\n  "size": %s,\n  "commitId": "%s"\n}\n' \
+              "$VERSION" "$RELEASE_DATE" "$ARTIFACT_PATH" "$SHA256" "$SIZE" "$SHORT_SHA" > "latest-win-${ENV}.json"
+
+            echo "Generated latest-win-${ENV}.json:"
+            cat "latest-win-${ENV}.json"
+
+            # Upload manifest to bucket root
+            gsutil cp "latest-win-${ENV}.json" "gs://${BUCKET_NAME}/latest-win-${ENV}.json"
+            echo "Uploaded manifest to: gs://${BUCKET_NAME}/latest-win-${ENV}.json"
+          else
+            echo "EXE file not found, skipping manifest generation"
+          fi
